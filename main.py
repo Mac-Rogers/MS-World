@@ -1,494 +1,621 @@
-import math
 import sys
-import uuid
-from dataclasses import dataclass, field
-from typing import List, Optional
-
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
-from PySide6.QtGui import (
-    QAction,
-    QColor,
-    QFont,
-    QKeySequence,
-    QLinearGradient,
-    QPainter,
-    QPainterPath,
-    QPen,
-    QRadialGradient,
-    QShortcut,
-)
-from PySide6.QtWidgets import (
-    QApplication,
-    QInputDialog,
-    QMainWindow,
-    QWidget,
-)
-
-
-# -------------------------
-# Minimal vector math
-# -------------------------
-class Vec3:
-    __slots__ = ("x", "y", "z")
-
-    def __init__(self, x=0.0, y=0.0, z=0.0):
-        self.x = float(x)
-        self.y = float(y)
-        self.z = float(z)
-
-    def __add__(self, other):
-        return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
-
-    def __sub__(self, other):
-        return Vec3(self.x - other.x, self.y - other.y, self.z - other.z)
-
-    def __mul__(self, s: float):
-        return Vec3(self.x * s, self.y * s, self.z * s)
-
-    __rmul__ = __mul__
-
-    def __truediv__(self, s: float):
-        return Vec3(self.x / s, self.y / s, self.z / s)
-
-    def dot(self, other) -> float:
-        return self.x * other.x + self.y * other.y + self.z * other.z
-
-    def cross(self, other):
-        return Vec3(
-            self.y * other.z - self.z * other.y,
-            self.z * other.x - self.x * other.z,
-            self.x * other.y - self.y * other.x,
-        )
-
-    def length(self) -> float:
-        return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
-
-    def normalized(self):
-        l = self.length()
-        if l < 1e-9:
-            return Vec3(0, 0, 0)
-        return self / l
-
-    def tuple(self):
-        return self.x, self.y, self.z
-
-
-@dataclass
-class Camera:
-    yaw: float = 0.7
-    pitch: float = 0.25
-    distance: float = 12.0
-    target: Vec3 = field(default_factory=lambda: Vec3(0, 0, 0))
-    fov_deg: float = 45.0
-
-    def position(self) -> Vec3:
-        cp = math.cos(self.pitch)
-        sp = math.sin(self.pitch)
-        cy = math.cos(self.yaw)
-        sy = math.sin(self.yaw)
-        offset = Vec3(self.distance * cp * sy, self.distance * sp, self.distance * cp * cy)
-        return self.target + offset
-
-    def basis(self):
-        pos = self.position()
-        forward = (self.target - pos).normalized()
-        world_up = Vec3(0, 1, 0)
-        right = forward.cross(world_up).normalized()
-        if right.length() < 1e-8:
-            right = Vec3(1, 0, 0)
-        up = right.cross(forward).normalized()
-        return pos, forward, right, up
-
-
-@dataclass
-class TextBand:
-    text: str = "Double-click to edit"
-    latitude_deg: float = 0.0  # 0 = equator
-    size_px: int = 18
-    color: QColor = field(default_factory=lambda: QColor(30, 30, 30))
-
-
-@dataclass
-class SphereObject:
-    center: Vec3
-    radius: float = 1.5
-    bands: List[TextBand] = field(default_factory=lambda: [TextBand()])
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
-
-class Viewport3D(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setMouseTracking(True)
-
-        self.camera = Camera()
-        self.spheres: List[SphereObject] = [SphereObject(center=Vec3(0, 0, 0), radius=1.8)]
-        self.selected_id: Optional[str] = self.spheres[0].id
-
-        self.last_mouse: Optional[QPoint] = None
-        self.orbiting = False
-        self.panning = False
-
-        self.background_top = QColor(12, 16, 24)
-        self.background_bottom = QColor(30, 40, 55)
-        self.light_dir = Vec3(-0.5, 0.8, 0.7).normalized()
-
-        self.move_speed = 0.35
-        self.status_text = "Left drag: orbit | Right drag: pan | Wheel: zoom | Double-click sphere: edit | Ctrl+N: new sphere"
-
-    # ---------- camera + projection ----------
-    def project(self, p_world: Vec3):
-        pos, forward, right, up = self.camera.basis()
-        rel = p_world - pos
-        x_cam = rel.dot(right)
-        y_cam = rel.dot(up)
-        z_cam = rel.dot(forward)
-        if z_cam <= 0.01:
-            return None
-
-        h = max(1, self.height())
-        w = max(1, self.width())
-        f = 0.5 * h / math.tan(math.radians(self.camera.fov_deg) * 0.5)
-        sx = w * 0.5 + (x_cam * f / z_cam)
-        sy = h * 0.5 - (y_cam * f / z_cam)
-        return QPointF(sx, sy), z_cam
-
-    def projected_radius(self, center: Vec3, radius: float) -> Optional[float]:
-        proj = self.project(center)
-        if proj is None:
-            return None
-        pos, _, right, _ = self.camera.basis()
-        edge = center + right * radius
-        p0 = self.project(center)
-        p1 = self.project(edge)
-        if p0 is None or p1 is None:
-            return None
-        return math.hypot(p1[0].x() - p0[0].x(), p1[0].y() - p0[0].y())
-
-    # ---------- sphere management ----------
-    def selected_sphere(self) -> Optional[SphereObject]:
-        for s in self.spheres:
-            if s.id == self.selected_id:
-                return s
-        return None
-
-    def add_sphere_in_front(self):
-        pos, forward, _, _ = self.camera.basis()
-        center = self.camera.target + forward * 1.0
-        radius = 1.5
-        sphere = SphereObject(center=center, radius=radius)
-        self.spheres.append(sphere)
-        self.selected_id = sphere.id
-        self.update()
-
-    def pick_sphere(self, point: QPointF) -> Optional[str]:
-        best = None
-        best_depth = float("inf")
-        for sphere in self.spheres:
-            proj = self.project(sphere.center)
-            pr = self.projected_radius(sphere.center, sphere.radius)
-            if proj is None or pr is None:
-                continue
-            screen_pt, depth = proj
-            d = math.hypot(point.x() - screen_pt.x(), point.y() - screen_pt.y())
-            if d <= pr and depth < best_depth:
-                best_depth = depth
-                best = sphere.id
-        return best
-
-    # ---------- painting ----------
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setRenderHint(QPainter.TextAntialiasing)
-
-        bg = QLinearGradient(0, 0, 0, self.height())
-        bg.setColorAt(0.0, self.background_top)
-        bg.setColorAt(1.0, self.background_bottom)
-        painter.fillRect(self.rect(), bg)
-
-        items = []
-        for s in self.spheres:
-            proj = self.project(s.center)
-            pr = self.projected_radius(s.center, s.radius)
-            if proj is None or pr is None or pr < 2:
-                continue
-            screen_pt, depth = proj
-            items.append((depth, s, screen_pt, pr))
-        items.sort(reverse=True, key=lambda t: t[0])
-
-        for _, sphere, center2d, rad_px in items:
-            self.draw_sphere(painter, sphere, center2d, rad_px)
-            for band in sphere.bands:
-                self.draw_text_band(painter, sphere, band)
-
-        painter.setPen(QColor(230, 235, 240, 220))
-        painter.setFont(QFont("Segoe UI", 10))
-        painter.drawText(14, self.height() - 16, self.status_text)
-
-        sel = self.selected_sphere()
-        if sel:
-            painter.setPen(QColor(245, 248, 250, 200))
-            painter.drawText(14, 26, f"Selected sphere | text: {sel.bands[0].text[:60]}")
-
-    def draw_sphere(self, painter: QPainter, sphere: SphereObject, center2d: QPointF, rad_px: float):
-        rect = QRectF(center2d.x() - rad_px, center2d.y() - rad_px, 2 * rad_px, 2 * rad_px)
-
-        # Soft shadow
-        shadow_rect = rect.adjusted(rad_px * 0.08, rad_px * 0.1, rad_px * 0.28, rad_px * 0.3)
-        shadow = QRadialGradient(shadow_rect.center(), shadow_rect.width() * 0.58)
-        shadow.setColorAt(0.0, QColor(0, 0, 0, 55))
-        shadow.setColorAt(1.0, QColor(0, 0, 0, 0))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(shadow)
-        painter.drawEllipse(shadow_rect)
-
-        # Sphere fill with highlight offset toward light direction
-        light_offset = QPointF(-rad_px * 0.28, -rad_px * 0.33)
-        grad = QRadialGradient(center2d + light_offset, rad_px * 0.2, center2d + light_offset)
-        grad.setColorAt(0.0, QColor(255, 255, 255))
-        grad.setColorAt(0.35, QColor(246, 247, 249))
-        grad.setColorAt(0.75, QColor(228, 231, 236))
-        grad.setColorAt(1.0, QColor(192, 198, 207))
-        painter.setBrush(grad)
-        painter.setPen(QPen(QColor(255, 255, 255, 90), 1.2))
-        painter.drawEllipse(rect)
-
-        # Rim / ambient curve
-        rim = QRadialGradient(center2d, rad_px)
-        rim.setColorAt(0.82, QColor(0, 0, 0, 0))
-        rim.setColorAt(1.0, QColor(40, 48, 58, 45))
-        painter.setBrush(rim)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(rect)
-
-        # Selection highlight
-        if sphere.id == self.selected_id:
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(100, 180, 255, 215), 2.2))
-            painter.drawEllipse(rect.adjusted(-4, -4, 4, 4))
-
-    def draw_text_band(self, painter: QPainter, sphere: SphereObject, band: TextBand):
-        text = band.text
-        if not text:
-            return
-
-        lat = math.radians(max(-80.0, min(80.0, band.latitude_deg)))
-        # Use front-facing arc only. Text wraps around horizontally by using longitude.
-        longitudes = self.compute_band_layout(sphere, band, text)
-        if not longitudes:
-            return
-
-        font = QFont("Segoe UI", band.size_px)
-        painter.setFont(font)
-        painter.setPen(band.color)
-
-        for ch, lon in zip(text, longitudes):
-            # front hemisphere visibility by surface normal facing camera
-            p, east, normal = self.surface_frame(sphere, lon, lat)
-            if p is None:
-                continue
-            cam_pos, _, _, _ = self.camera.basis()
-            view_dir = (cam_pos - p).normalized()
-            facing = normal.dot(view_dir)
-            if facing <= 0.05:
-                continue
-
-            proj = self.project(p)
-            if proj is None:
-                continue
-            screen_pt, _ = proj
-
-            # Character tangent direction in screen space
-            p_east = p + east * (sphere.radius * 0.08)
-            proj_east = self.project(p_east)
-            if proj_east is None:
-                continue
-            east_pt, _ = proj_east
-            dx = east_pt.x() - screen_pt.x()
-            dy = east_pt.y() - screen_pt.y()
-            angle_deg = math.degrees(math.atan2(dy, dx))
-
-            alpha = int(max(30, min(255, 70 + 185 * facing)))
-            painter.save()
-            painter.translate(screen_pt)
-            painter.rotate(angle_deg)
-            painter.setPen(QColor(band.color.red(), band.color.green(), band.color.blue(), alpha))
-            # Draw a tiny shadow for readability
-            painter.drawText(QPointF(1.0, 1.0), ch)
-            painter.setPen(QColor(band.color.red(), band.color.green(), band.color.blue(), alpha))
-            painter.drawText(QPointF(0.0, 0.0), ch)
-            painter.restore()
-
-    def compute_band_layout(self, sphere: SphereObject, band: TextBand, text: str):
-        # Approximate width allocation by glyph count. This is an MVP and intentionally simple.
-        circumference_px = self.estimated_visible_circumference_px(sphere, band.latitude_deg)
-        if circumference_px <= 10:
-            return []
-
-        avg_char_px = band.size_px * 0.62
-        total_px = len(text) * avg_char_px
-        arc_fraction = min(0.92, max(0.08, total_px / max(circumference_px, 1)))
-        total_angle = 2 * math.pi * arc_fraction
-        start = -0.5 * total_angle
-
-        positions = []
-        if len(text) == 1:
-            return [0.0]
-        for i in range(len(text)):
-            t = i / (len(text) - 1)
-            positions.append(start + t * total_angle)
-        return positions
-
-    def estimated_visible_circumference_px(self, sphere: SphereObject, latitude_deg: float) -> float:
-        lat = math.radians(latitude_deg)
-        ring_radius_world = sphere.radius * math.cos(lat)
-        center = sphere.center + Vec3(0, sphere.radius * math.sin(lat), 0)
-        pr = self.projected_radius(center, ring_radius_world)
-        if pr is None:
-            return 0.0
-        return 2 * math.pi * pr
-
-    def surface_frame(self, sphere: SphereObject, lon: float, lat: float):
-        # longitude around Y axis, latitude around equator
-        cp = math.cos(lat)
-        sp = math.sin(lat)
-        cl = math.cos(lon)
-        sl = math.sin(lon)
-
-        normal = Vec3(cp * sl, sp, cp * cl).normalized()
-        point = sphere.center + normal * sphere.radius
-        east = Vec3(cp * cl, 0.0, -cp * sl).normalized()
-        return point, east, normal
-
-    # ---------- input ----------
-    def mousePressEvent(self, event):
-        self.last_mouse = event.position().toPoint()
-        if event.button() == Qt.LeftButton:
-            picked = self.pick_sphere(event.position())
-            if picked:
-                self.selected_id = picked
-            self.orbiting = True
-        elif event.button() == Qt.RightButton:
-            self.panning = True
-        self.update()
-
-    def mouseMoveEvent(self, event):
-        if self.last_mouse is None:
-            self.last_mouse = event.position().toPoint()
-            return
-
-        current = event.position().toPoint()
-        delta = current - self.last_mouse
-        self.last_mouse = current
-
-        if self.orbiting:
-            self.camera.yaw -= delta.x() * 0.008
-            self.camera.pitch += delta.y() * 0.008
-            self.camera.pitch = max(-1.45, min(1.45, self.camera.pitch))
-            self.update()
-        elif self.panning:
-            _, _, right, up = self.camera.basis()
-            scale = 0.005 * self.camera.distance
-            self.camera.target = self.camera.target - right * (delta.x() * scale) + up * (delta.y() * scale)
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.orbiting = False
-        elif event.button() == Qt.RightButton:
-            self.panning = False
-        self.last_mouse = None
-
-    def wheelEvent(self, event):
-        delta = event.angleDelta().y() / 120.0
-        self.camera.distance *= math.pow(0.88, delta)
-        self.camera.distance = max(2.0, min(60.0, self.camera.distance))
-        self.update()
-
-    def mouseDoubleClickEvent(self, event):
-        picked = self.pick_sphere(event.position())
-        if not picked:
-            return
-        self.selected_id = picked
-        sphere = self.selected_sphere()
-        if sphere is None:
-            return
-        current = sphere.bands[0].text
-        text, ok = QInputDialog.getMultiLineText(self, "Edit sphere text", "Text around sphere:", current)
-        if ok:
-            sphere.bands[0].text = text.strip() or current
-            self.update()
-
-    def keyPressEvent(self, event):
-        pos, forward, right, up = self.camera.basis()
-        speed = self.move_speed * max(1.0, self.camera.distance / 10.0)
-
-        if event.key() == Qt.Key_W:
-            self.camera.target = self.camera.target + forward * speed
-        elif event.key() == Qt.Key_S:
-            self.camera.target = self.camera.target - forward * speed
-        elif event.key() == Qt.Key_A:
-            self.camera.target = self.camera.target - right * speed
-        elif event.key() == Qt.Key_D:
-            self.camera.target = self.camera.target + right * speed
-        elif event.key() == Qt.Key_Q:
-            self.camera.target = self.camera.target + up * speed
-        elif event.key() == Qt.Key_E:
-            self.camera.target = self.camera.target - up * speed
-        elif event.key() == Qt.Key_F and self.selected_sphere() is not None:
-            self.camera.target = self.selected_sphere().center
-        elif event.key() == Qt.Key_Delete and self.selected_sphere() is not None and len(self.spheres) > 1:
-            sid = self.selected_id
-            self.spheres = [s for s in self.spheres if s.id != sid]
-            self.selected_id = self.spheres[0].id if self.spheres else None
+import math
+import textwrap
+import numpy as np
+import pygame
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+import ctypes
+
+# ── tkinter file dialog (stdlib, no extra install needed) ─────────────────────
+import tkinter as tk
+from tkinter import filedialog
+
+def open_image_dialog():
+    """Open a native file-picker and return the chosen path, or None."""
+    root = tk.Tk()
+    root.withdraw()          # hide the empty Tk window
+    root.attributes('-topmost', True)
+    path = filedialog.askopenfilename(
+        title="Choose an image for the sphere",
+        filetypes=[
+            ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tga *.webp"),
+            ("All files",   "*.*"),
+        ]
+    )
+    root.destroy()
+    return path if path else None
+
+# ── Constants ────────────────────────────────────────────────────────────────
+# We'll set WIN_W, WIN_H at runtime from the display resolution
+WIN_W, WIN_H = 0, 0
+FPS          = 60
+BASE_RADIUS  = 1.5
+RADIUS_PER_CHAR = 0.012
+MAX_RADIUS   = 4.5
+FONT_SIZE    = 100
+BANNER_H     = 300
+
+COLORS = [
+    ((0.20, 0.20, 0.20), (1.0,  1.0,  1.0 )),
+    ((0.30, 0.30, 0.30), (0.95, 0.95, 0.95)),
+    ((0.25, 0.25, 0.25), (0.98, 0.98, 0.98)),
+    ((0.15, 0.15, 0.15), (0.93, 0.93, 0.93)),
+    ((0.35, 0.35, 0.35), (0.97, 0.97, 0.97)),
+]
+
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+class Banner:
+    def __init__(self, path="banner.png"):
+        self.tex = None; self.w = self.h = 0
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            iw, ih = img.get_width(), img.get_height()
+            if ih > BANNER_H:
+                scale = BANNER_H / ih
+                img = pygame.transform.smoothscale(img, (int(iw * scale), BANNER_H))
+            self.w, self.h = img.get_size()
+            data = pygame.image.tostring(img, "RGBA", True)
+            tid  = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, tid)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, self.w, self.h,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+            self.tex = tid
+        except Exception as e:
+            print(f"[banner] {e}")
+
+    def draw(self):
+        if not self.tex: return
+        _draw_quad(self.tex, 0, 0, WIN_W, self.h)
+
+    def free(self):
+        if self.tex: glDeleteTextures([self.tex])
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+class Sidebar:
+    def __init__(self, path="sidebar.png"):
+        self.tex = None; self.w = self.h = 0
+        try:
+            img    = pygame.image.load(path).convert_alpha()
+            iw, ih = img.get_width(), img.get_height()
+            avail_h = WIN_H - BANNER_H
+            if ih > avail_h:
+                scale = avail_h / ih
+                img = pygame.transform.smoothscale(img, (int(iw * scale), avail_h))
+            self.w, self.h = img.get_size()
+            data = pygame.image.tostring(img, "RGBA", True)
+            tid  = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, tid)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, self.w, self.h,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+            self.tex = tid
+        except Exception as e:
+            print(f"[sidebar] {e}")
+
+    def draw(self):
+        if not self.tex: return
+        _draw_quad(self.tex, 0, BANNER_H, self.w, BANNER_H + self.h)
+
+    def free(self):
+        if self.tex: glDeleteTextures([self.tex])
+
+
+# ── Shared texture helpers ────────────────────────────────────────────────────
+def _upload_surface(surf, wrap_s=GL_CLAMP_TO_EDGE, wrap_t=GL_CLAMP_TO_EDGE, mipmap=False):
+    """Upload a pygame Surface as a GL texture; return the texture ID."""
+    data = pygame.image.tostring(surf, "RGBA", True)
+    tid  = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tid)
+    min_f = GL_LINEAR_MIPMAP_LINEAR if mipmap else GL_LINEAR
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_f)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_s)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_t)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surf.get_width(), surf.get_height(),
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+    if mipmap:
+        glGenerateMipmap(GL_TEXTURE_2D)
+    return tid
+
+
+def _draw_quad(tid, x0, y0, x1, y1):
+    """Draw a textured quad in the current 2-D ortho pass."""
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, tid)
+    glColor4f(1, 1, 1, 1)
+    glBegin(GL_QUADS)
+    glTexCoord2f(0, 1); glVertex2f(x0, y0)
+    glTexCoord2f(1, 1); glVertex2f(x1, y0)
+    glTexCoord2f(1, 0); glVertex2f(x1, y1)
+    glTexCoord2f(0, 0); glVertex2f(x0, y1)
+    glEnd()
+    glDisable(GL_TEXTURE_2D)
+
+
+# ── Sphere ───────────────────────────────────────────────────────────────────
+class Sphere:
+    _id_counter = 0
+
+    def __init__(self, position, color_idx=0):
+        Sphere._id_counter += 1
+        self.id         = Sphere._id_counter
+        self.pos        = list(position)
+        self.text       = ""
+        self.image_path = None          # set when an image is loaded
+        self.color_idx  = color_idx % len(COLORS)
+        self.texture_id = None
+        self.quadric    = gluNewQuadric()
+        gluQuadricTexture(self.quadric, GL_TRUE)
+        gluQuadricNormals(self.quadric, GLU_SMOOTH)
+        self._rebuild_texture()
+        self.spin  = 0.0
+        self.angle = 0.0
+
+    # ── mode helpers ─────────────────────────────────────────────────────────
+    @property
+    def is_image(self):
+        return self.image_path is not None
+
+    def load_image(self, path):
+        """Replace sphere content with an image texture."""
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            # Keep the image's natural aspect ratio on the sphere.
+            # We upload it at a fixed size; gluSphere will wrap it around.
+            img = pygame.transform.smoothscale(img, (2048, 1024))
+            if self.texture_id is not None:
+                glDeleteTextures([self.texture_id])
+            self.texture_id = _upload_surface(
+                img,
+                wrap_s=GL_REPEAT,
+                wrap_t=GL_CLAMP_TO_EDGE,
+                mipmap=True,
+            )
+            self.image_path = path
+            self.text       = ""   # clear any text
+        except Exception as e:
+            print(f"[sphere] could not load image {path}: {e}")
+
+    # ── radius ───────────────────────────────────────────────────────────────
+    @property
+    def radius(self):
+        if self.is_image:
+            return BASE_RADIUS        # image spheres stay fixed size
+        width = 2048
+        chars_per_line = max(12, int(width / (FONT_SIZE * 0.60)))
+        display  = self.text if self.text else ""
+        wrapped  = []
+        for raw in display.splitlines() or [display]:
+            wrapped.extend(textwrap.wrap(raw, width=chars_per_line) or [""])
+        line_count = max(1, len(wrapped))
+        start_grow = 2
+        if line_count > start_grow:
+            r = BASE_RADIUS + (line_count - start_grow) * (RADIUS_PER_CHAR * 24)
         else:
-            super().keyPressEvent(event)
-            return
-        self.update()
+            r = BASE_RADIUS
+        return min(r, MAX_RADIUS)
 
+    # ── text editing ─────────────────────────────────────────────────────────
+    def add_char(self, ch):
+        if self.is_image: return
+        self.text += ch
+        self._rebuild_texture()
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Sphere Writer MVP")
-        self.resize(1400, 900)
+    def backspace(self):
+        if self.is_image: return
+        if self.text:
+            self.text = self.text[:-1]
+            self._rebuild_texture()
 
-        self.viewport = Viewport3D()
-        self.setCentralWidget(self.viewport)
+    # ── texture build (text mode) ─────────────────────────────────────────────
+    def _rebuild_texture(self):
+        if self.is_image:
+            return   # image texture is already uploaded
+        text_color, bg_color = COLORS[self.color_idx]
+        width, height = 2048, 512
+        surf = pygame.Surface((width, height), pygame.SRCALPHA)
+        bg   = tuple(int(c * 255) for c in bg_color)
+        surf.fill((*bg, 255))
 
-        new_action = QAction("New Sphere", self)
-        new_action.setShortcut(QKeySequence("Ctrl+N"))
-        new_action.triggered.connect(self.viewport.add_sphere_in_front)
-        self.addAction(new_action)
+        font           = pygame.font.SysFont("monospace", FONT_SIZE, bold=True)
+        chars_per_line = max(12, int(width / (FONT_SIZE * 0.60)))
+        display        = self.text if self.text else ""
+        lines          = []
+        for raw in display.splitlines() or [display]:
+            lines.extend(textwrap.wrap(raw, width=chars_per_line) or [""])
 
-        edit_action = QAction("Edit Text", self)
-        edit_action.setShortcut(QKeySequence("Ctrl+E"))
-        edit_action.triggered.connect(self.edit_selected)
-        self.addAction(edit_action)
+        tc     = tuple(int(c * 255) for c in text_color)
+        line_h = FONT_SIZE + 8
+        total_h = len(lines) * line_h
+        y = (height - total_h) // 2
 
-        QShortcut(QKeySequence("Ctrl+N"), self, activated=self.viewport.add_sphere_in_front)
-        QShortcut(QKeySequence("Ctrl+E"), self, activated=self.edit_selected)
+        for line in lines:
+            rendered = font.render(line, True, tc)
+            surf.blit(rendered, (20, y))
+            y += line_h
 
-        self.statusBar().showMessage(
-            "Ctrl+N: new sphere | Ctrl+E or double-click: edit | WASDQE: move | F: focus selected | Delete: delete selected"
+        if self.texture_id is not None:
+            glDeleteTextures([self.texture_id])
+        self.texture_id = _upload_surface(
+            surf, wrap_s=GL_REPEAT, wrap_t=GL_CLAMP_TO_EDGE
         )
 
-    def edit_selected(self):
-        sphere = self.viewport.selected_sphere()
-        if sphere is None:
-            return
-        current = sphere.bands[0].text
-        text, ok = QInputDialog.getMultiLineText(self, "Edit sphere text", "Text around sphere:", current)
-        if ok:
-            sphere.bands[0].text = text.strip() or current
-            self.viewport.update()
+    # ── draw ─────────────────────────────────────────────────────────────────
+    def draw(self, selected):
+        glPushMatrix()
+        glTranslatef(*self.pos)
+        glRotatef(-90, 1, 0, 0)
+        glRotatef(180, 0, 0, 1)   # face the camera on initial load
+        glRotatef(self.angle, 0, 1, 0)
+        r = self.radius
+
+        if selected:
+            glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING)
+            glColor4f(0.91, 0.30, 0.16, 0.6)
+            glLineWidth(2.5)
+            self._draw_circle(r + 0.08, 80)
+            glRotatef(90, 1, 0, 0)
+            self._draw_circle(r + 0.08, 80)
+            glRotatef(-90, 1, 0, 0)
+            glLineWidth(1.0)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_TEXTURE_2D)
+
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.texture_id)
+        glColor4f(1, 1, 1, 1)
+        gluSphere(self.quadric, r, 64, 64)
+        glDisable(GL_TEXTURE_2D)
+        glPopMatrix()
+
+    def _draw_circle(self, r, segs):
+        glBegin(GL_LINE_LOOP)
+        for i in range(segs):
+            a = 2 * math.pi * i / segs
+            glVertex3f(math.cos(a) * r, math.sin(a) * r, 0)
+        glEnd()
+
+    def cleanup(self):
+        if self.texture_id: glDeleteTextures([self.texture_id])
+        gluDeleteQuadric(self.quadric)
+
+
+# ── Camera ────────────────────────────────────────────────────────────────────
+class Camera:
+    def __init__(self):
+        self.theta  = 0.3
+        self.phi    = 1.2
+        self.radius = 18.0
+        self.target = [0.0, 0.0, 0.0]
+
+    def apply(self):
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity()
+        eye = self._eye()
+        gluLookAt(eye[0], eye[1], eye[2],
+                  self.target[0], self.target[1], self.target[2], 0, 1, 0)
+
+    def _eye(self):
+        return (
+            self.target[0] + self.radius * math.sin(self.phi) * math.sin(self.theta),
+            self.target[1] + self.radius * math.cos(self.phi),
+            self.target[2] + self.radius * math.sin(self.phi) * math.cos(self.theta),
+        )
+
+    def orbit(self, dx, dy):
+        self.theta -= dx * 0.007
+        self.phi    = max(0.15, min(math.pi - 0.15, self.phi + dy * 0.007))
+
+    def pan(self, dx, dy):
+        rx = math.cos(self.theta);  rz = -math.sin(self.theta)
+        ux = math.cos(self.phi) * math.sin(self.theta)
+        uy = -math.sin(self.phi)
+        uz = math.cos(self.phi) * math.cos(self.theta)
+        s  = self.radius * 0.001
+        self.target[0] += (-dx * rx + dy * ux) * s
+        self.target[1] +=  dy * uy * s
+        self.target[2] += (-dx * rz + dy * uz) * s
+
+    def zoom(self, delta):
+        self.radius = max(3, min(80, self.radius - delta * 0.8))
+
+    def look_at(self, pos, radius):
+        self.target = list(pos); self.radius = radius * 4.5
+
+
+# ── Picking ───────────────────────────────────────────────────────────────────
+def pick_sphere(spheres, mx, my, camera):
+    proj = glGetDoublev(GL_PROJECTION_MATRIX)
+    mv   = glGetDoublev(GL_MODELVIEW_MATRIX)
+    vp   = glGetIntegerv(GL_VIEWPORT)
+    near = gluUnProject(mx, WIN_H - my, 0.0, mv, proj, vp)
+    far  = gluUnProject(mx, WIN_H - my, 1.0, mv, proj, vp)
+    ro   = np.array(near)
+    rd   = np.array(far) - ro;  rd /= np.linalg.norm(rd)
+    best, best_t = None, 1e18
+    for s in spheres:
+        oc   = ro - np.array(s.pos)
+        b    = np.dot(oc, rd)
+        c    = np.dot(oc, oc) - s.radius ** 2
+        disc = b * b - c
+        if disc >= 0:
+            t = -b - math.sqrt(disc)
+            if 0 < t < best_t:
+                best_t = t; best = s
+    return best
+
+
+def project_depth(world_pos):
+    proj = glGetDoublev(GL_PROJECTION_MATRIX)
+    mv   = glGetDoublev(GL_MODELVIEW_MATRIX)
+    vp   = glGetIntegerv(GL_VIEWPORT)
+    _, _, wz = gluProject(world_pos[0], world_pos[1], world_pos[2], mv, proj, vp)
+    return wz
+
+
+def unproject_at_depth(mx, my, depth):
+    proj = glGetDoublev(GL_PROJECTION_MATRIX)
+    mv   = glGetDoublev(GL_MODELVIEW_MATRIX)
+    vp   = glGetIntegerv(GL_VIEWPORT)
+    return gluUnProject(mx, WIN_H - my, depth, mv, proj, vp)
+
+
+# ── HUD ───────────────────────────────────────────────────────────────────────
+class HUD:
+    def __init__(self):
+        self.font_big = pygame.font.SysFont("monospace", 14, bold=True)
+        self.font_sm  = pygame.font.SysFont("monospace", 12)
+
+    def draw(self, screen, spheres, selected, cursor_visible):
+        surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+
+        y = BANNER_H + 6
+        surf.blit(self.font_sm.render(
+            "drag=orbit  right-drag=pan  scroll=zoom  click=select  Ctrl+N=new  Ctrl+I=image  Del=delete",
+            True, (80, 78, 72)), (16, y)); y += 18
+        surf.blit(self.font_sm.render("SPHERES", True, (100, 96, 90)), (16, y)); y += 18
+
+        for s in spheres:
+            col     = (232, 77, 42) if s is selected else (180, 175, 165)
+            if s.is_image:
+                import os
+                preview = f"[img] {os.path.basename(s.image_path)[:18]}"
+            else:
+                preview = s.text[:20] + ("…" if len(s.text) > 20 else "") if s.text else ""
+            surf.blit(self.font_sm.render(f"● #{s.id}  {preview}", True, col), (16, y)); y += 18
+
+        if selected:
+            if selected.is_image:
+                import os
+                info = f"Selected: #{selected.id}  |  image: {os.path.basename(selected.image_path)}"
+                hint = "Ctrl+I to replace image"
+            else:
+                info = f"Selected: #{selected.id}  |  {len(selected.text)} chars  |  R={selected.radius:.2f}"
+                hint = "Ctrl+I (on empty sphere) to add image"
+            surf.blit(self.font_sm.render(info, True, (232, 77, 42)), (16, WIN_H - 50))
+
+            if not selected.is_image:
+                display = selected.text + ("|" if cursor_visible else " ")
+                lines   = textwrap.wrap(display, 80) or [display]
+                for i, line in enumerate(lines[-3:]):
+                    surf.blit(self.font_sm.render(line, True, (200, 200, 200)),
+                              (16, WIN_H - 30 + i * 14 - (len(lines[-3:]) - 1) * 14))
+            else:
+                surf.blit(self.font_sm.render(hint, True, (160, 160, 140)), (16, WIN_H - 30))
+        else:
+            surf.blit(self.font_sm.render("Click a sphere to select it, then type  |  Ctrl+I on empty sphere = image",
+                                           True, (90, 86, 80)), (16, WIN_H - 30))
+
+        screen.blit(surf, (0, 0))
+
+
+# ── GL setup ──────────────────────────────────────────────────────────────────
+def setup_gl():
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glEnable(GL_LIGHTING); glEnable(GL_LIGHT0); glEnable(GL_LIGHT1)
+    glEnable(GL_COLOR_MATERIAL)
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+    glLightfv(GL_LIGHT0, GL_POSITION, [ 8.0,  12.0,  10.0, 1.0])
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,  [ 1.0,   0.85,  0.7, 1.0])
+    glLightfv(GL_LIGHT0, GL_SPECULAR, [ 0.5,   0.5,   0.5, 1.0])
+    glLightfv(GL_LIGHT1, GL_POSITION, [-6.0,  -4.0,  -8.0, 1.0])
+    glLightfv(GL_LIGHT1, GL_DIFFUSE,  [ 0.2,   0.3,   0.5, 1.0])
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.15, 0.15, 0.18, 1.0])
+    glViewport(0, 0, WIN_W, WIN_H)
+    glMatrixMode(GL_PROJECTION); glLoadIdentity()
+    gluPerspective(55, WIN_W / WIN_H, 0.1, 200)
+    glMatrixMode(GL_MODELVIEW)
+
+
+def draw_grid():
+    glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D)
+    glColor4f(0.15, 0.15, 0.2, 0.6); glLineWidth(1.0)
+    glBegin(GL_LINES)
+    for i in range(-30, 31, 2):
+        glVertex3f(i, -6, -30); glVertex3f(i,  -6,  30)
+        glVertex3f(-30, -6, i); glVertex3f(30, -6,   i)
+    glEnd()
+    glEnable(GL_LIGHTING)
+
+
+def new_sphere_position(spheres):
+    angle = len(spheres) * 137.5
+    r     = 4 + len(spheres) * 0.5
+    return (math.cos(math.radians(angle)) * r,
+            (len(spheres) % 3 - 1) * 2.0,
+            math.sin(math.radians(angle)) * r)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    global WIN_W, WIN_H
+
+    # Tell Windows we are DPI-aware so we get real pixel coordinates
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+    pygame.init()
+
+    # Get screen size and use a borderless window instead of FULLSCREEN
+    info = pygame.display.Info()
+    WIN_W = info.current_w
+    WIN_H = info.current_h
+    pygame.display.set_mode((WIN_W, WIN_H), DOUBLEBUF | OPENGL | NOFRAME)
+    pygame.display.set_caption("MS World")
+    pygame.key.set_repeat(400, 50)
+
+    setup_gl()
+
+    banner  = Banner("banner.png")
+    sidebar = Sidebar("sidebar.png")
+    camera  = Camera()
+    hud     = HUD()
+    spheres = []; selected = None; color_idx = 0
+
+    s = Sphere((0, 0, 0), color_idx)
+    s.text = "Hello world"; s._rebuild_texture(); spheres.append(s)
+
+    mouse_down_left  = False
+    mouse_down_right = False
+    last_mouse       = (0, 0)
+    dragged          = False
+    dragging_sphere  = None
+    drag_depth       = None
+
+    clock = pygame.time.Clock(); cursor_timer = 0; cursor_visible = True
+
+    running = True
+    while running:
+        dt = clock.tick(FPS) / 1000.0
+        cursor_timer += dt
+        if cursor_timer > 0.5:
+            cursor_timer = 0; cursor_visible = not cursor_visible
+
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                running = False
+
+            elif event.type == KEYDOWN:
+                ctrl = pygame.key.get_mods() & KMOD_CTRL
+
+                # ── Ctrl+I : load image onto selected (empty or image) sphere ─
+                if ctrl and event.key == K_i:
+                    if selected is not None and (not selected.text or selected.is_image):
+                        # Pause pygame event processing while dialog is open
+                        path = open_image_dialog()
+                        if path:
+                            selected.load_image(path)
+                        # Re-focus the OpenGL window
+                        pygame.event.clear()
+
+                # ── Ctrl+N : new sphere ───────────────────────────────────────
+                elif ctrl and event.key == K_n:
+                    pos = new_sphere_position(spheres)
+                    sp  = Sphere(pos, color_idx % len(COLORS))
+                    color_idx += 1; spheres.append(sp); selected = sp
+                    camera.look_at(pos, sp.radius)
+
+                # ── Text editing (non-image sphere) ───────────────────────────
+                elif selected and not selected.is_image:
+                    if   event.key == K_BACKSPACE: selected.backspace()
+                    elif event.key == K_RETURN:    selected.add_char('\n')
+                    elif event.key == K_ESCAPE:    selected = None
+                    elif not ctrl and event.unicode and event.unicode.isprintable():
+                        selected.add_char(event.unicode)
+
+                elif selected and event.key == K_ESCAPE:
+                    selected = None
+
+                # ── Delete empty sphere ───────────────────────────────────────
+                if not ctrl and event.key == K_DELETE:
+                    if selected and not selected.text and not selected.is_image:
+                        selected.cleanup(); spheres.remove(selected); selected = None
+
+            elif event.type == MOUSEBUTTONDOWN:
+                in_banner = event.pos[1] < BANNER_H
+
+                if event.button == 1 and not in_banner:
+                    dragged = False; last_mouse = event.pos; camera.apply()
+                    hit = pick_sphere(spheres, event.pos[0], event.pos[1], camera)
+                    if hit is not None:
+                        selected = hit; dragging_sphere = hit
+                        drag_depth = project_depth(hit.pos); mouse_down_left = False
+                    else:
+                        mouse_down_left = True
+
+                elif event.button == 3 and not in_banner:
+                    mouse_down_right = True; last_mouse = event.pos
+
+                elif event.button == 4: camera.zoom(3)
+                elif event.button == 5: camera.zoom(-3)
+
+            elif event.type == MOUSEBUTTONUP:
+                if event.button == 1:
+                    if dragging_sphere is not None:
+                        dragging_sphere = None; drag_depth = None
+                    if mouse_down_left and not dragged:
+                        camera.apply()
+                        selected = pick_sphere(spheres, event.pos[0], event.pos[1], camera)
+                    mouse_down_left = False
+                elif event.button == 3:
+                    mouse_down_right = False
+
+            elif event.type == MOUSEMOTION:
+                mx, my = event.pos
+                dx = mx - last_mouse[0]; dy = my - last_mouse[1]
+                if dragging_sphere is not None and drag_depth is not None:
+                    camera.apply()
+                    wx, wy, wz = unproject_at_depth(mx, my, drag_depth)
+                    dragging_sphere.pos = [wx, wy, wz]; dragged = True
+                elif mouse_down_left and abs(dx) + abs(dy) > 2:
+                    dragged = True; camera.orbit(dx, dy)
+                if mouse_down_right:
+                    camera.pan(dx, dy)
+                last_mouse = event.pos
+
+        # ── 3-D render ────────────────────────────────────────────────────────
+        glClearColor(0.85, 0.85, 0.87, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        camera.apply(); draw_grid()
+        for sp in spheres:
+            sp.draw(sp is selected)
+
+        # ── 2-D overlay ───────────────────────────────────────────────────────
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+        glOrtho(0, WIN_W, WIN_H, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+        glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glEnable(GL_BLEND)
+
+        hud_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        hud.draw(hud_surf, spheres, selected, cursor_visible)
+        glRasterPos2i(0, 0)
+        glDrawPixels(WIN_W, WIN_H, GL_RGBA, GL_UNSIGNED_BYTE,
+                     pygame.image.tostring(hud_surf, "RGBA", True))
+
+        banner.draw()
+        sidebar.draw()
+
+        glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
+        glMatrixMode(GL_PROJECTION); glPopMatrix()
+        glMatrixMode(GL_MODELVIEW); glPopMatrix()
+        pygame.display.flip()
+
+    for sp in spheres: sp.cleanup()
+    banner.free(); sidebar.free(); pygame.quit()
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setApplicationName("Sphere Writer MVP")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    main()
