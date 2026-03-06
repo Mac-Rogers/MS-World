@@ -149,13 +149,25 @@ class Sphere:
 
     @property
     def radius(self):
-        chars_per_line = max(50, int(2048 / (FONT_SIZE * 0.55)))
-        text_lines = max(1, len(self.text) // chars_per_line)
-        max_lines = 4
-        if text_lines > max_lines:
-            r = BASE_RADIUS + (text_lines - max_lines) * RADIUS_PER_CHAR * 10
+        width = 2048
+        chars_per_line = max(12, int(width / (FONT_SIZE * 0.60)))
+
+        display = self.text if self.text else "[ empty ]"
+        wrapped = []
+        for raw in display.splitlines() or [display]:
+            wrapped.extend(textwrap.wrap(raw, width=chars_per_line) or [""])
+
+        line_count = max(1, len(wrapped))
+
+        # grow sooner
+        start_grow_after = 2
+
+        if line_count > start_grow_after:
+            # grow faster
+            r = BASE_RADIUS + (line_count - start_grow_after) * (RADIUS_PER_CHAR * 24)
         else:
             r = BASE_RADIUS
+
         return min(r, MAX_RADIUS)
 
     def add_char(self, ch):
@@ -175,9 +187,13 @@ class Sphere:
         surf.fill((*bg, 255))
 
         font = pygame.font.SysFont("monospace", FONT_SIZE, bold=True)
-        chars_per_line = max(50, int(width / (FONT_SIZE * 0.55)))
+
+        # Match wrap logic with radius()
+        chars_per_line = max(12, int(width / (FONT_SIZE * 0.60)))
         display = self.text if self.text else "[ empty ]"
-        lines = textwrap.wrap(display, width=chars_per_line) or [display]
+        lines = []
+        for raw in display.splitlines() or [display]:
+            lines.extend(textwrap.wrap(raw, width=chars_per_line) or [""])
 
         tc = tuple(int(c * 255) for c in text_color)
         line_h = FONT_SIZE + 8
@@ -208,6 +224,7 @@ class Sphere:
     def draw(self, selected):
         glPushMatrix()
         glTranslatef(*self.pos)
+        glRotatef(-90, 1, 0, 0)  # Rotate 90 degrees on X-axis
         glRotatef(self.angle, 0, 1, 0)
         r = self.radius
 
