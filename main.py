@@ -34,8 +34,10 @@ FPS          = 60
 BASE_RADIUS  = 1.5
 RADIUS_PER_CHAR = 0.012
 MAX_RADIUS   = 4.5
-FONT_SIZE    = 100
+FONT_SIZES = [48, 64, 80, 100, 120, 150, 200]
+FONT_SIZE_LABELS = ["48", "64", "80", "100", "120", "150", "200"]
 BANNER_H     = 300
+FONT_SIZE    = 80   # default font size
 
 COLORS = [
     ((0.20, 0.20, 0.20), (1.0,  1.0,  1.0 )),
@@ -45,6 +47,9 @@ COLORS = [
     ((0.35, 0.35, 0.35), (0.97, 0.97, 0.97)),
 ]
 
+# ── Links between spheres ────────────────────────────────────────────────────
+# Each link is a frozenset of two sphere IDs
+links = set()
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 class Banner:
@@ -111,6 +116,119 @@ class Sidebar:
         if self.tex: glDeleteTextures([self.tex])
 
 
+# ── Dropdown Menu ─────────────────────────────────────────────────────────────
+class DropdownMenu:
+    """A simple font-size dropdown rendered in the 2-D ortho pass."""
+
+    def __init__(self, x, y, w, item_h=28):
+        self.x      = x
+        self.y      = y
+        self.w      = w
+        self.item_h = item_h
+        self.open   = False
+        self.selected_idx = 2          # index into FONT_SIZES (default 80)
+        self.font   = pygame.font.SysFont("calibri", 20, bold=False)
+
+    @property
+    def current_size(self):
+        return FONT_SIZES[self.selected_idx]
+
+    @property
+    def button_rect(self):
+        """Rect of the closed button (screen coords, y-down)."""
+        return (self.x, self.y, self.w, self.item_h)
+
+    def _item_rects(self):
+        """Yield (index, x, y, w, h) for each dropdown row."""
+        bx, by, bw, bh = self.button_rect
+        for i in range(len(FONT_SIZES)):
+            iy = by + bh + i * self.item_h
+            yield i, bx, iy, bw, self.item_h
+
+    def hit_test(self, mx, my):
+        """Return True if the click was consumed by this menu."""
+        bx, by, bw, bh = self.button_rect
+
+        # Click on the button itself → toggle
+        if bx <= mx <= bx + bw and by <= my <= by + bh:
+            self.open = not self.open
+            return True
+
+        # Click on an open item → select
+        if self.open:
+            for i, ix, iy, iw, ih in self._item_rects():
+                if ix <= mx <= ix + iw and iy <= my <= iy + ih:
+                    self.selected_idx = i
+                    self.open = False
+                    return True
+
+            # Click elsewhere → close
+            self.open = False
+            return True
+
+        return False
+
+    def draw_gl(self):
+        """Draw the dropdown using immediate-mode GL quads + text textures."""
+        bx, by, bw, bh = self.button_rect
+
+        # ── button background ─────────────────────────────────────────────
+        self._draw_rect(bx, by, bw, bh, (1.0, 1.0, 1.0, 1.0))
+
+        # ── button label ──────────────────────────────────────────────────
+        label = f"{self.current_size}"
+        self._draw_text(label, bx + 8, by + 4, (0.15, 0.15, 0.15))
+
+        if not self.open:
+            return
+
+        # ── dropdown items ────────────────────────────────────────────────
+        for i, ix, iy, iw, ih in self._item_rects():
+            if i == self.selected_idx:
+                self._draw_rect(ix, iy, iw, ih, (0.22, 0.47, 0.85, 0.95))
+            else:
+                self._draw_rect(ix, iy, iw, ih, (1.0, 1.0, 1.0, 0.97))
+
+            tc = (1.0, 1.0, 1.0) if i == self.selected_idx else (0.15, 0.15, 0.15)
+            self._draw_text(FONT_SIZE_LABELS[i], ix + 8, iy + 4, tc)
+
+    # ── GL helpers ────────────────────────────────────────────────────────
+    @staticmethod
+    def _draw_rect(x, y, w, h, color):
+        glDisable(GL_TEXTURE_2D)
+        glColor4f(*color)
+        glBegin(GL_QUADS)
+        glVertex2f(x,     y)
+        glVertex2f(x + w, y)
+        glVertex2f(x + w, y + h)
+        glVertex2f(x,     y + h)
+        glEnd()
+
+    def _draw_text(self, text, x, y, color):
+        """Render a small text string via a throwaway GL texture."""
+        surf = self.font.render(text, True,
+                                tuple(int(c * 255) for c in color))
+        surf = surf.convert_alpha()
+        tw, th = surf.get_size()
+        data = pygame.image.tostring(surf, "RGBA", True)
+        tid  = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tid)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+        glEnable(GL_TEXTURE_2D)
+        glColor4f(1, 1, 1, 1)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 1); glVertex2f(x,      y)
+        glTexCoord2f(1, 1); glVertex2f(x + tw, y)
+        glTexCoord2f(1, 0); glVertex2f(x + tw, y + th)
+        glTexCoord2f(0, 0); glVertex2f(x,      y + th)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        glDeleteTextures([tid])
+
+
 # ── Shared texture helpers ────────────────────────────────────────────────────
 def _upload_surface(surf, wrap_s=GL_CLAMP_TO_EDGE, wrap_t=GL_CLAMP_TO_EDGE, mipmap=False):
     """Upload a pygame Surface as a GL texture; return the texture ID."""
@@ -147,13 +265,14 @@ def _draw_quad(tid, x0, y0, x1, y1):
 class Sphere:
     _id_counter = 0
 
-    def __init__(self, position, color_idx=0):
+    def __init__(self, position, color_idx=0, font_size=None):
         Sphere._id_counter += 1
         self.id         = Sphere._id_counter
         self.pos        = list(position)
         self.text       = ""
-        self.image_path = None          # set when an image is loaded
+        self.image_path = None
         self.color_idx  = color_idx % len(COLORS)
+        self.font_size  = font_size if font_size else FONT_SIZE
         self.texture_id = None
         self.quadric    = gluNewQuadric()
         gluQuadricTexture(self.quadric, GL_TRUE)
@@ -191,9 +310,9 @@ class Sphere:
     @property
     def radius(self):
         if self.is_image:
-            return BASE_RADIUS        # image spheres stay fixed size
+            return BASE_RADIUS
         width = 2048
-        chars_per_line = max(12, int(width / (FONT_SIZE * 0.60)))
+        chars_per_line = max(12, int(width / (self.font_size * 0.60)))
         display  = self.text if self.text else ""
         wrapped  = []
         for raw in display.splitlines() or [display]:
@@ -221,22 +340,27 @@ class Sphere:
     # ── texture build (text mode) ─────────────────────────────────────────────
     def _rebuild_texture(self):
         if self.is_image:
-            return   # image texture is already uploaded
+            return
         text_color, bg_color = COLORS[self.color_idx]
-        width, height = 2048, 512
+        width = 2048
+
+        r = self.radius
+        height = int(512 * (r / BASE_RADIUS))
+        height = max(512, min(height, 4096))
+
         surf = pygame.Surface((width, height), pygame.SRCALPHA)
         bg   = tuple(int(c * 255) for c in bg_color)
         surf.fill((*bg, 255))
 
-        font           = pygame.font.SysFont("monospace", FONT_SIZE, bold=True)
-        chars_per_line = max(12, int(width / (FONT_SIZE * 0.60)))
+        font           = pygame.font.SysFont("monospace", self.font_size, bold=True)
+        chars_per_line = max(12, int(width / (self.font_size * 0.60)))
         display        = self.text if self.text else ""
         lines          = []
         for raw in display.splitlines() or [display]:
             lines.extend(textwrap.wrap(raw, width=chars_per_line) or [""])
 
         tc     = tuple(int(c * 255) for c in text_color)
-        line_h = FONT_SIZE + 8
+        line_h = self.font_size + 8
         total_h = len(lines) * line_h
         y = (height - total_h) // 2
 
@@ -449,17 +573,40 @@ def draw_grid():
     glEnable(GL_LIGHTING)
 
 
+def draw_links(spheres):
+    """Draw connecting lines between linked spheres."""
+    global links
+    if not links:
+        return
+    by_id = {s.id: s for s in spheres}
+    glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D)
+    glColor4f(0.35, 0.35, 0.40, 0.9)
+    glLineWidth(2.5)
+    glBegin(GL_LINES)
+    for link in links:
+        ids = list(link)
+        if len(ids) == 2 and ids[0] in by_id and ids[1] in by_id:
+            a = by_id[ids[0]]
+            b = by_id[ids[1]]
+            glVertex3f(*a.pos)
+            glVertex3f(*b.pos)
+    glEnd()
+    glLineWidth(1.0)
+    glEnable(GL_LIGHTING)
+
+
 def new_sphere_position(spheres):
-    angle = len(spheres) * 137.5
-    r     = 4 + len(spheres) * 0.5
-    return (math.cos(math.radians(angle)) * r,
-            (len(spheres) % 3 - 1) * 2.0,
-            math.sin(math.radians(angle)) * r)
+    """Return a position for a new sphere that doesn't overlap existing ones."""
+    if not spheres:
+        return [0.0, 0.0, 0.0]
+    # Place new sphere to the right of the rightmost existing sphere
+    max_x = max(s.pos[0] + s.radius for s in spheres)
+    return [max_x + BASE_RADIUS * 2.5, 0.0, 0.0]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global WIN_W, WIN_H
+    global WIN_W, WIN_H, links
 
     # Tell Windows we are DPI-aware so we get real pixel coordinates
     try:
@@ -479,13 +626,15 @@ def main():
 
     setup_gl()
 
-    banner  = Banner("banner.png")
-    sidebar = Sidebar("sidebar.png")
-    camera  = Camera()
-    hud     = HUD()
-    spheres = []; selected = None; color_idx = 0
+    banner   = Banner("banner.png")
+    sidebar  = Sidebar("sidebar.png")
+    dropdown = DropdownMenu(x=350, y=BANNER_H - 160, w=45)
+    camera   = Camera()
+    hud      = HUD()
+    spheres  = []; selected = None; color_idx = 0
+    selected_set = set()   # for multi-select (shift+click)
 
-    s = Sphere((0, 0, 0), color_idx)
+    s = Sphere((0, 0, 0), color_idx, font_size=dropdown.current_size)
     s.text = "Hello world"; s._rebuild_texture(); spheres.append(s)
 
     mouse_down_left  = False
@@ -509,51 +658,95 @@ def main():
                 running = False
 
             elif event.type == KEYDOWN:
-                ctrl = pygame.key.get_mods() & KMOD_CTRL
+                ctrl  = pygame.key.get_mods() & KMOD_CTRL
+                shift = pygame.key.get_mods() & KMOD_SHIFT
+
+                # ── L : link all spheres in selected_set ──────────────────────
+                if event.key == K_l and not ctrl:
+                    sel_list = list(selected_set)
+                    if len(sel_list) >= 2:
+                        # Link every pair
+                        for i in range(len(sel_list)):
+                            for j in range(i + 1, len(sel_list)):
+                                pair = frozenset((sel_list[i].id, sel_list[j].id))
+                                if pair in links:
+                                    links.discard(pair)  # toggle off
+                                else:
+                                    links.add(pair)      # toggle on
 
                 # ── Ctrl+I : load image onto selected (empty or image) sphere ─
-                if ctrl and event.key == K_i:
+                elif ctrl and event.key == K_i:
                     if selected is not None and (not selected.text or selected.is_image):
-                        # Pause pygame event processing while dialog is open
                         path = open_image_dialog()
                         if path:
                             selected.load_image(path)
-                        # Re-focus the OpenGL window
                         pygame.event.clear()
 
                 # ── Ctrl+N : new sphere ───────────────────────────────────────
                 elif ctrl and event.key == K_n:
                     pos = new_sphere_position(spheres)
-                    sp  = Sphere(pos, color_idx % len(COLORS))
+                    sp  = Sphere(pos, color_idx % len(COLORS), font_size=dropdown.current_size)
                     color_idx += 1; spheres.append(sp); selected = sp
+                    selected_set = {sp}
                     camera.look_at(pos, sp.radius)
 
                 # ── Text editing (non-image sphere) ───────────────────────────
                 elif selected and not selected.is_image:
                     if   event.key == K_BACKSPACE: selected.backspace()
                     elif event.key == K_RETURN:    selected.add_char('\n')
-                    elif event.key == K_ESCAPE:    selected = None
+                    elif event.key == K_ESCAPE:
+                        selected = None; selected_set.clear()
                     elif not ctrl and event.unicode and event.unicode.isprintable():
-                        selected.add_char(event.unicode)
+                        if event.key != K_l:  # don't type 'l' when linking
+                            selected.add_char(event.unicode)
 
                 elif selected and event.key == K_ESCAPE:
-                    selected = None
+                    selected = None; selected_set.clear()
 
                 # ── Delete empty sphere ───────────────────────────────────────
                 if not ctrl and event.key == K_DELETE:
                     if selected and not selected.text and not selected.is_image:
+                        # Remove any links involving this sphere
+                        links.discard(frozenset((selected.id,)))
+                        to_remove = {lnk for lnk in links if selected.id in lnk}
+                        links -= to_remove
+                        selected_set.discard(selected)
                         selected.cleanup(); spheres.remove(selected); selected = None
 
             elif event.type == MOUSEBUTTONDOWN:
                 in_banner = event.pos[1] < BANNER_H
+                shift = pygame.key.get_mods() & KMOD_SHIFT
+
+                # Check dropdown first
+                if event.button == 1 and dropdown.hit_test(event.pos[0], event.pos[1]):
+                    if selected and not selected.is_image:
+                        selected.font_size = dropdown.current_size
+                        selected._rebuild_texture()
+                    continue
 
                 if event.button == 1 and not in_banner:
                     dragged = False; last_mouse = event.pos; camera.apply()
                     hit = pick_sphere(spheres, event.pos[0], event.pos[1], camera)
                     if hit is not None:
-                        selected = hit; dragging_sphere = hit
-                        drag_depth = project_depth(hit.pos); mouse_down_left = False
+                        if shift:
+                            # Shift+click: toggle in multi-select set
+                            if hit in selected_set:
+                                selected_set.discard(hit)
+                                if selected is hit:
+                                    selected = next(iter(selected_set), None)
+                            else:
+                                selected_set.add(hit)
+                                selected = hit
+                        else:
+                            # Normal click: single select
+                            selected = hit
+                            selected_set = {hit}
+                        dragging_sphere = hit
+                        drag_depth = project_depth(hit.pos)
+                        mouse_down_left = False
                     else:
+                        if not shift:
+                            selected = None; selected_set.clear()
                         mouse_down_left = True
 
                 elif event.button == 3 and not in_banner:
@@ -568,7 +761,23 @@ def main():
                         dragging_sphere = None; drag_depth = None
                     if mouse_down_left and not dragged:
                         camera.apply()
-                        selected = pick_sphere(spheres, event.pos[0], event.pos[1], camera)
+                        hit = pick_sphere(spheres, event.pos[0], event.pos[1], camera)
+                        shift = pygame.key.get_mods() & KMOD_SHIFT
+                        if hit is not None:
+                            if shift:
+                                if hit in selected_set:
+                                    selected_set.discard(hit)
+                                    if selected is hit:
+                                        selected = next(iter(selected_set), None)
+                                else:
+                                    selected_set.add(hit)
+                                    selected = hit
+                            else:
+                                selected = hit
+                                selected_set = {hit}
+                        else:
+                            if not shift:
+                                selected = None; selected_set.clear()
                     mouse_down_left = False
                 elif event.button == 3:
                     mouse_down_right = False
@@ -590,8 +799,9 @@ def main():
         glClearColor(0.85, 0.85, 0.87, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         camera.apply(); draw_grid()
+        draw_links(spheres)
         for sp in spheres:
-            sp.draw(sp is selected)
+            sp.draw(sp in selected_set)
 
         # ── 2-D overlay ───────────────────────────────────────────────────────
         glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
@@ -607,6 +817,7 @@ def main():
 
         banner.draw()
         sidebar.draw()
+        dropdown.draw_gl()
 
         glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
         glMatrixMode(GL_PROJECTION); glPopMatrix()
